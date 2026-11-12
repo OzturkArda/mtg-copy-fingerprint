@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-card_diff.py - tell two physical copies of the same card printing apart from photos.
+copy_fingerprint.py - tell two physical copies of the same Magic: The Gathering card printing
+apart from photos.
 
 Copies of one printing carry no unique ID, so this compares the two things that
 do differ between physical copies:
@@ -16,8 +17,8 @@ Method
   - Align on the print, cancel lighting differences, and map what is left.
 
 Usage
-  python card_diff.py a.jpg b.jpg --out report.png
-  python card_diff.py a.jpg b.jpg --json
+  python copy_fingerprint.py a.jpg b.jpg --out report.png
+  python copy_fingerprint.py a.jpg b.jpg --json
 
 Exit code: 0 = no difference detected, 1 = difference detected, 2 = error.
 
@@ -30,6 +31,7 @@ it reports is your setup's noise floor, and --tol-mm must sit above it.
 """
 import argparse
 import json
+import os
 import sys
 
 import cv2
@@ -42,6 +44,28 @@ W, H = int(CARD_W * PX), int(CARD_H * PX)
 
 class CardError(Exception):
     pass
+
+
+def load_image(path):
+    """Read a photo as a BGR array: JPEG and PNG through OpenCV, HEIC (the iPhone default)
+    through pillow-heif."""
+    if not os.path.isfile(path):
+        raise CardError(f"cannot read {path}: no such file")
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is not None:
+        return img
+    try:
+        import pillow_heif
+        from PIL import Image, ImageOps
+    except ImportError:
+        raise CardError(f"cannot read {path} as an image (HEIC photos need `pip install pillow-heif`)") from None
+    pillow_heif.register_heif_opener()
+    try:
+        with Image.open(path) as im:
+            rgb = ImageOps.exif_transpose(im).convert("RGB")
+    except Exception:
+        raise CardError(f"cannot read {path} as an image (JPEG, PNG or HEIC)") from None
+    return cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
 
 
 # --------------------------------------------------------------------------
@@ -144,7 +168,8 @@ def rectify(img):
     long_px = (np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) / 2
     short_px = (np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])) / 2
     if abs(long_px / short_px / (CARD_H / CARD_W) - 1) > 0.08:
-        raise CardError("outline does not have a 63x88 mm card's proportions: shoot from straight above, whole card in frame")
+        raise CardError("outline does not have a 63x88 mm card's proportions: shoot from straight above, whole card "
+                        "in frame, on a background that contrasts with the card's border")
     ppm = long_px / CARD_H
     if ppm > PX:                                              # anti-alias before downsampling
         img = cv2.GaussianBlur(img, (0, 0), 0.5 * np.sqrt((ppm / PX) ** 2 - 1))
@@ -191,6 +216,10 @@ def register_print(a, b):
                                            maxIters=5000, confidence=0.999, refineIters=20)
     if mat is None or int(inl.sum()) < 30:
         raise CardError("the two photos do not show the same card design")
+    # Both prints sit on the same 63x88 mm canvas, so a true match has scale ~1. Many-to-one
+    # feature matches between different designs can pass RANSAC with a collapsed transform.
+    if not 0.95 < float(np.hypot(mat[0, 0], mat[1, 0])) < 1.05:
+        raise CardError("the two photos do not show the same card design")
     keep = inl.ravel() > 0
     res = pb[keep] @ mat[:, :2].T + mat[:, 2] - pa[keep]
     return mat, int(keep.sum()), float(np.sqrt((res ** 2).sum(1).mean()))
@@ -229,6 +258,36 @@ def _glare(img):
     return cv2.dilate(big.astype(np.uint8) * 255, k)
 
 
+def _clipped_highlights(a, b, valid):
+    """Pixels saturated in one photo where the other photo is bright too: the same light print
+    detail clipped by a brighter exposure, not a mark. Whitening on a dark area is kept, because
+    the other copy is dark there."""
+    ma, mb = a.max(axis=2).astype(np.float32), b.max(axis=2).astype(np.float32)
+    v = valid > 0
+    gain = float(np.median(mb[v])) / max(float(np.median(ma[v])), 1.0)   # B's exposure relative to A's
+    both = ((ma >= 250) & (mb >= 200 * gain)) | ((mb >= 250) & (ma >= 200 / gain))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    return cv2.dilate(both.astype(np.uint8) * 255, k)
+
+
+def _match_colour(a, b, valid):
+    """Map B's colours onto A's with one affine colour transform, so a different exposure or
+    white balance is not read as marks. Fitted on unclipped pixels, refitted without outliers
+    so real marks do not pull the fit."""
+    pa, pb = a[valid > 0].astype(np.float32), b[valid > 0].astype(np.float32)
+    ok = (pa.max(1) < 250) & (pb.max(1) < 250) & (pa.min(1) > 5) & (pb.min(1) > 5)
+    pa, pb = pa[ok][::7], pb[ok][::7]
+    if len(pa) < 1000:
+        return b
+    x = np.column_stack([pb, np.ones(len(pb), np.float32)])
+    keep = np.ones(len(pb), bool)
+    for _ in range(2):
+        m = np.linalg.lstsq(x[keep], pa[keep], rcond=None)[0]
+        res = np.abs(x @ m - pa).max(1)
+        keep = res < max(3 * 1.4826 * float(np.median(res)), 6.0)
+    return np.clip(b.astype(np.float32) @ m[:3] + m[3], 0, 255).astype(np.uint8)
+
+
 def _match_sharpness(ga, gb, valid):
     """Blur the sharper image down to the softer one, so focus differences are not read as marks."""
     def sharp(g):
@@ -248,6 +307,7 @@ def _match_sharpness(ga, gb, valid):
 
 def find_marks(a, b, valid, min_area_mm2, k_sigma):
     """Localised differences between two print-aligned images. Returns (marks, difference map)."""
+    b = _match_colour(a, b, valid)
     ga = cv2.GaussianBlur(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY).astype(np.float32), (0, 0), 1.0)
     gb = cv2.GaussianBlur(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY).astype(np.float32), (0, 0), 1.0)
     ga, gb = _match_sharpness(ga, gb, valid)
@@ -317,13 +377,7 @@ def find_marks(a, b, valid, min_area_mm2, k_sigma):
 # --------------------------------------------------------------------------
 
 def compare(path_a, path_b, tol_mm=0.15, min_mark_mm2=0.03, k_sigma=6.0):
-    imgs = []
-    for p in (path_a, path_b):
-        img = cv2.imread(p, cv2.IMREAD_COLOR)
-        if img is None:
-            raise CardError(f"cannot read {p} (convert HEIC to JPEG or PNG first)")
-        imgs.append(img)
-    (a, ppm_a), (b, ppm_b) = rectify(imgs[0]), rectify(imgs[1])
+    (a, ppm_a), (b, ppm_b) = rectify(load_image(path_a)), rectify(load_image(path_b))
 
     mat, inliers, rms = register_print(a, b)
     if mat[0, 0] < 0:                                         # B was shot upside down
@@ -339,6 +393,7 @@ def compare(path_a, path_b, tol_mm=0.15, min_mark_mm2=0.03, k_sigma=6.0):
     valid = shape & cv2.warpAffine(shape, mat, (W, H), flags=cv2.INTER_NEAREST)
     glare = _glare(a) | cv2.warpAffine(_glare(b), mat, (W, H), flags=cv2.INTER_NEAREST)
     valid = valid & ~glare
+    valid = valid & ~_clipped_highlights(a, b_al, valid)
     marks, dmap = find_marks(a, b_al, valid, min_mark_mm2, k_sigma)
     differing = float((dmap > 1)[valid > 0].mean())
     if differing > 0.03:                                      # two copies of one printing never differ this much
@@ -359,7 +414,7 @@ def compare(path_a, path_b, tol_mm=0.15, min_mark_mm2=0.03, k_sigma=6.0):
         warnings.append("cut edges were located inconsistently (shadow, curl or low contrast): centering result is unreliable")
     glare_pct = 100.0 * float((glare > 0).sum()) / float((shape > 0).sum())
     if glare_pct > 2:
-        warnings.append(f"{glare_pct:.0f}% of the card is hidden by glare and was not compared")
+        warnings.append(f"{glare_pct:.0f}% of the card is blown out (glare or overexposure) and was not compared")
 
     return {
         "verdict": "DIFFERENCE DETECTED" if reasons else "NO DIFFERENCE DETECTED",
@@ -369,14 +424,14 @@ def compare(path_a, path_b, tol_mm=0.15, min_mark_mm2=0.03, k_sigma=6.0):
         "tolerance_mm": tol_mm,
         "marks": marks,
         "registration": {"inliers": inliers, "rms_px": round(rms, 2)},
-        "photo_px_per_mm": [round(ppm_a, 1), round(ppm_b, 1)],
+        "photo_px_per_mm": [round(float(ppm_a), 1), round(float(ppm_b), 1)],
         "warnings": warnings,
         "_images": (a, b_al, dmap),
     }
 
 
 def text_report(r):
-    c = r["centering"]
+    c = {k: round(v, 2) + 0.0 for k, v in r["centering"].items()}   # + 0.0 turns -0.00 into +0.00
     out = [r["verdict"] + (": " + " + ".join(r["reasons"]) if r["reasons"] else
                            " (same copy, or two copies these photos cannot separate)"),
            "",

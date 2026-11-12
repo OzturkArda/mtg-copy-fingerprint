@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-synth_test.py - ground-truth test for card_diff.py.
+synth_test.py - ground-truth test for copy_fingerprint.py.
 
-Renders one synthetic card "printing", cuts several physical copies from it with
-known centering offsets and known marks, photographs them with random pose,
-perspective, lighting, shadow, blur, noise and JPEG compression, then checks what
-card_diff.py recovers.
+Renders one card "printing" (a synthetic design, or a real card scan with --scan),
+cuts several physical copies from it with known centering offsets and known marks,
+photographs them with random pose, perspective, lighting, shadow, lens distortion,
+blur, noise and JPEG compression, then checks what copy_fingerprint.py recovers.
 
   python synth_test.py OUTPUT_DIR [trials]
+  python synth_test.py OUTPUT_DIR 8 --scan bolt.png              # real card art
+  python synth_test.py OUTPUT_DIR 8 --scan angel.png --bg 40,38,36  # white border, dark table
 """
+import argparse
 import os
 import sys
 
@@ -16,7 +19,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import card_diff as cd  # noqa: E402
+import copy_fingerprint as cd  # noqa: E402
 
 PPM = 30      # render resolution, px per mm
 BLEED = 2.0   # printed area beyond the nominal cut, mm
@@ -62,6 +65,27 @@ def make_print(seed=7):
     for i in range(7):
         text(" ".join(rng.choice(words, 6)), 6.5, 60.5 + 3.1 * i, 1.9, 4)
     return img
+
+
+def print_from_scan(path):
+    """A real card scan (e.g. a Scryfall PNG) as a printing: scaled to PPM, rounded corners and
+    BLEED filled with the border colour."""
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise SystemExit(f"cannot read {path}")
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    bgr = img[..., :3].astype(np.float32)
+    alpha = img[..., 3:].astype(np.float32) / 255 if img.shape[2] == 4 else np.ones_like(bgr[..., :1])
+    h, w = bgr.shape[:2]
+    e = max(2, h // 150)                                       # sample the border just inside the edge
+    ring = np.concatenate([bgr[e:2 * e, w // 4:3 * w // 4].reshape(-1, 3),
+                           bgr[h - 2 * e:h - e, w // 4:3 * w // 4].reshape(-1, 3)])
+    border = np.median(ring, axis=0)
+    card = cv2.resize(bgr * alpha + border * (1 - alpha), (mm(63), mm(88)), interpolation=cv2.INTER_CUBIC)
+    b = mm(BLEED)
+    pr = cv2.copyMakeBorder(card, b, b, b, b, cv2.BORDER_CONSTANT, value=[float(v) for v in border])
+    return np.clip(pr, 0, 255).astype(np.uint8)
 
 
 def rand_marks(rng, n):
@@ -115,10 +139,10 @@ def make_copy(pr, ox=0.0, oy=0.0, rot=0.0, marks=()):
     return card, alpha
 
 
-def shoot(card, alpha, rng, flip=False, out_wh=(3000, 4000)):
+def shoot(card, alpha, rng, flip=False, out_wh=(3000, 4000), bg_bgr=(176, 196, 205)):
     """Photograph a copy: random pose and perspective, shadow, lighting, blur, noise, JPEG."""
     wo, ho = out_wh
-    bg = np.full((ho, wo, 3), (176, 196, 205), np.float32)
+    bg = np.full((ho, wo, 3), bg_bgr, np.float32)
     bg += cv2.resize(rng.normal(0, 5, (ho // 40, wo // 40)).astype(np.float32), (wo, ho), interpolation=cv2.INTER_CUBIC)[..., None]
     hc, wc = card.shape[:2]
     sc = rng.uniform(0.62, 0.72) * ho / hc
@@ -150,16 +174,16 @@ def shoot(card, alpha, rng, flip=False, out_wh=(3000, 4000)):
     return cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
 
-def run(outdir, trials=8, seed=1):
+def run(outdir, trials=8, seed=1, scan=None, bg_bgr=(176, 196, 205)):
     os.makedirs(outdir, exist_ok=True)
     rng = np.random.default_rng(seed)
-    pr = make_print()
+    pr = print_from_scan(scan) if scan else make_print()
     n = [0]
 
     def photo(copy, flip=False):
         n[0] += 1
         p = os.path.join(outdir, f"shot_{n[0]:03d}.jpg")
-        cv2.imwrite(p, shoot(*copy, rng, flip=flip))
+        cv2.imwrite(p, shoot(*copy, rng, flip=flip, bg_bgr=bg_bgr))
         return p
 
     def base():
@@ -173,7 +197,8 @@ def run(outdir, trials=8, seed=1):
         r = cd.compare(photo(copy), photo(copy, flip=(i % 4 == 3)))
         floor.append(r["centering"]["max_displacement_mm"])
         false_marks += len(r["marks"])
-        print(f"  disp {floor[-1]:.3f} mm  scale {r['centering']['scale_mismatch_pct']:+.2f}%  marks {len(r['marks'])}  -> {r['verdict']}")
+        print(f"  disp {floor[-1]:.3f} mm  scale {r['centering']['scale_mismatch_pct']:+.2f}%  marks {len(r['marks'])}  -> {r['verdict']}"
+              + "".join(f"\n    warning: {w}" for w in r["warnings"]))
     print(f"  noise floor: median {np.median(floor):.3f} mm, max {np.max(floor):.3f} mm; false marks: {false_marks}")
 
     print("== 2. Two mint copies, centering differs by a known amount ==")
@@ -231,9 +256,9 @@ def run(outdir, trials=8, seed=1):
 
 
     print("== 5. Failure paths ==")
-    other = make_print(seed=99)
+    other = make_print(seed=99)   # any design other than pr
     for label, fn in (("different card design", lambda: cd.compare(photo(make_copy(pr)), photo(make_copy(other)))),
-                      ("photo with no card", lambda: cd.compare(photo(make_copy(pr)), _blank(outdir)))):
+                      ("photo with no card", lambda: cd.compare(photo(make_copy(pr)), _blank(outdir, bg_bgr)))):
         try:
             fn()
             print(f"  {label}: NOT REJECTED")
@@ -241,11 +266,18 @@ def run(outdir, trials=8, seed=1):
             print(f"  {label}: rejected ({e})")
 
 
-def _blank(outdir):
+def _blank(outdir, bg_bgr):
     p = os.path.join(outdir, "blank.jpg")
-    cv2.imwrite(p, np.full((4000, 3000, 3), (176, 196, 205), np.uint8))
+    cv2.imwrite(p, np.full((4000, 3000, 3), bg_bgr, np.uint8))
     return p
 
 
 if __name__ == "__main__":
-    run(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 8)
+    ap = argparse.ArgumentParser(description="Ground-truth test for copy_fingerprint.py on simulated photos.")
+    ap.add_argument("outdir", help="where the simulated photos are written")
+    ap.add_argument("trials", nargs="?", type=int, default=8, help="pairs per test row (default 8)")
+    ap.add_argument("--scan", help="use this card scan (PNG/JPEG, e.g. from Scryfall) as the printing")
+    ap.add_argument("--bg", default="176,196,205", help="background colour as B,G,R (default 176,196,205, light beige)")
+    ap.add_argument("--seed", type=int, default=1)
+    args = ap.parse_args()
+    run(args.outdir, args.trials, args.seed, args.scan, tuple(int(v) for v in args.bg.split(",")))
