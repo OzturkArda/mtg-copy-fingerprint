@@ -232,7 +232,7 @@ def run(outdir, trials=8, seed=1, scan=None, bg_bgr=(176, 196, 205)):
         pa, pb = photo(make_copy(pr, ox, oy, rot, marks)), photo(make_copy(pr, ox, oy, rot))
         r = cd.compare(pa, pb)
         pts = np.array([[m["x_mm"], m["y_mm"]] for m in r["marks"]]).reshape(-1, 2)
-        used = set()
+        used, missed = set(), []
         for m in marks:
             if m[0] == "speck":
                 seg = [(m[1], m[2])]
@@ -244,12 +244,16 @@ def run(outdir, trials=8, seed=1, scan=None, bg_bgr=(176, 196, 205)):
             near = [j for j in range(len(pts)) if min(np.hypot(pts[j][0] - x, pts[j][1] - y) for x, y in seg) < 2.5]
             found += bool(near)
             used.update(near)
+            if not near:
+                missed.append((m[0], *np.mean(seg, axis=0)))
         extra += len(pts) - len(used)
+        print(f"  planted {len(marks)}, reported {len(r['marks'])}, disp {r['centering']['max_displacement_mm']:.3f} mm -> {r['verdict']}")
+        for kind, x, y in missed:
+            print(f"    missed planted {kind} at ({x:.1f}, {y:.1f}) mm")
         for j in set(range(len(pts))) - used:
             print(f"    unexplained mark at {pts[j]} {r['marks'][j]}  pair: {pa} {pb}\n    planted: {marks}")
         if sample is None and len(r["marks"]) >= 3:
             sample = (pa, pb)
-        print(f"  planted {len(marks)}, reported {len(r['marks'])}, disp {r['centering']['max_displacement_mm']:.3f} mm -> {r['verdict']}")
     print(f"  planted marks found: {found}/{total}; reported marks with no planted cause: {extra}")
     if sample:
         print(f"  sample pair: {sample[0]} {sample[1]}")

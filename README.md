@@ -95,6 +95,13 @@ Results, 8 photo pairs per row. The real card art and the card back come from Sc
 | One copy worn: marks with no planted cause | 0 | 0 | 0 | 0 | 0 |
 | Different card, photo with no card | rejected | rejected | rejected | rejected | rejected |
 
+The marks it misses are faint ones. The planted marks are whitish. On real art many of them land
+on the light text box or a white border, where they differ from the print by fewer than 20 grey
+levels (out of 255) before any camera effects. The rest sit on highlights that clip in the
+brighter photo, which the tool leaves out, or show only where they cross fine text. In a separate
+run of 256 planted marks on the synthetic design, Lightning Bolt, Llanowar Elves and Serra Angel,
+the tool located 195 of the 199 marks that differ from the print by 20 grey levels or more.
+
 These are simulated photos. Real photos add card curl, uneven shadows, glare and dust, so expect a
 higher noise floor: calibrate as described above before trusting a centering verdict. The tool
 has not yet been tested on photos of physical cards.
@@ -103,6 +110,7 @@ has not yet been tested on photos of physical cards.
 
 - Two mint copies whose centering matches within your noise floor cannot be told apart.
 - Wear in the outer 0.5 mm of the edge is not compared.
+- Light marks on light areas, such as the text box or a white border, are often missed.
 - Foils and sleeved cards reflect too much light for a reliable comparison.
 - Dust on the card or the lens shows up as marks, so check the report image before trusting them.
 
