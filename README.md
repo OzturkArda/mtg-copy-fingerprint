@@ -1,68 +1,123 @@
-# card-diff
+# MTG Copy Fingerprint
 
-Tell two physical copies of the same trading-card printing apart from photos.
+Tell two physical copies of the same Magic: The Gathering card apart from photos.
 
-Copies of one printing carry no unique ID, so `card_diff.py` compares what physically differs:
+Two Lightning Bolts from the same set share their artwork, text and set symbol, and carry no
+serial number. Each physical copy still has a fingerprint of its own:
 
-1. **Cut registration**: where the print sits relative to the cut edge (centering and tilt).
-2. **Surface marks**: wear, scratches, print specks, whitening.
+1. **Centering.** Where the print sits relative to the cut edge. It is set at the factory when
+   the sheet is cut, differs from copy to copy by fractions of a millimetre, and stays with the
+   card for life.
+2. **Surface marks.** Scratches, print specks, scuffs and edge whitening.
 
-## Usage
+Give it two photos and it tells you whether they can be the same physical card, measures the
+centering difference between them, and circles the marks found on one copy but not the other.
+
+![Example report](example_report.png)
+
+## Quick start
 
 ```
+git clone https://github.com/OzturkArda/mtg-copy-fingerprint
+cd mtg-copy-fingerprint
 pip install -r requirements.txt
-python card_diff.py a.jpg b.jpg --out report.png
-python card_diff.py a.jpg b.jpg --json
+python copy_fingerprint.py a.jpg b.jpg --out report.png
 ```
 
-Exit code: `0` no difference detected, `1` difference detected, `2` error.
+```
+DIFFERENCE DETECTED: centering
 
-## Photos
+Centering   print displacement 0.30 mm (tolerance 0.15) -> differs
+            B's print vs A's: +0.30 mm right, +0.00 mm down, +0.00 deg
+Marks       0 found
+Quality     3625 matched print features, photos at 30 and 28 px/mm
+```
 
-One unsleeved card per photo, shot from straight above on a plain background that contrasts
-with the card border, no glare, card filling most of the frame. Fronts and backs both work.
+`--out` writes the three-panel image above: A, B aligned to A's print, and the differences with
+numbered marks. `--json` prints the same result for scripts. The exit code is `0` when no
+difference is found, `1` when one is, and `2` on an error such as a photo with no card in it.
 
-Calibrate first: run it on two photos of the **same** card. The print displacement it reports
-is your setup's noise floor, and `--tol-mm` must sit above it.
+| Option | Default | Meaning |
+|---|---|---|
+| `--tol-mm` | 0.15 | Print displacement above this counts as a centering difference |
+| `--min-mark-mm2` | 0.03 | Ignore marks smaller than this area |
+| `--mark-sigma` | 6 | Mark threshold, in multiples of the photo noise |
+
+## Taking the photos
+
+- One unsleeved card per photo, shot from straight above, filling most of the frame.
+- A plain background that contrasts with the card's border: light for black-bordered cards,
+  dark for white-bordered ones.
+- Soft, even light with no glare. Switch the flash off.
+- JPEG, PNG and HEIC (the iPhone default) all work.
+- Fronts and backs both work. Run it once per side.
+
+**Calibrate once for your setup.** Photograph the same card twice, picking it up in between, and
+compare the two photos. The print displacement it reports is your noise floor. Set `--tol-mm`
+comfortably above it.
 
 ## How it works
 
-- Finds each card's cut outline and rectifies it to a 63 x 88 mm canvas.
-- Registers print-to-print with SIFT. Both images are already aligned on the cut, so the
-  residual transform is the centering difference.
-- Aligns on the print, cancels lighting differences, and maps the remaining marks.
+1. Finds each card's cut outline to sub-pixel precision and straightens the card onto a
+   63 x 88 mm canvas, so both images are aligned on their cut edges.
+2. Matches thousands of print features between the two images (SIFT). Because the cut edges are
+   already aligned, whatever shift and rotation is left over is the centering difference.
+3. Aligns B onto A's print, evens out differences in exposure, white balance, lighting and
+   focus, and maps what remains as surface marks. Highlights blown out in only one photo are
+   left out, so a brighter shot does not read as wear.
 
-## Testing
+## Accuracy
 
-`synth_test.py` renders synthetic copies with known centering offsets and marks, photographs
-them with random pose, perspective, lighting, shadow, lens distortion, blur, noise and JPEG
-compression, and checks what the script recovers:
+`synth_test.py` cuts copies from one printing with known centering offsets and known marks, then
+photographs them with random pose, perspective, lens distortion, shadow, lighting, blur, noise
+and JPEG compression at 12 MP. It runs on a synthetic card design, or on a real card scan:
 
 ```
-python synth_test.py /tmp/card-diff-test 8
+python synth_test.py /tmp/shots 8                              # synthetic design
+python synth_test.py /tmp/shots 8 --scan bolt.png              # real card art, e.g. a Scryfall PNG
+python synth_test.py /tmp/shots 8 --scan angel.png --bg 40,38,36   # white border on a dark table
 ```
 
-Results on synthetic photos (8 trials per row, 12 MP shots at about 30 px/mm):
+Results, 8 photo pairs per row. The real card art and the card back come from Scryfall scans
+(745 x 1040 px) scaled up to the simulated print.
 
-| Test | Result |
-|---|---|
-| Same copy, two photos | 8/8 no difference; print displacement median 0.009 mm, max 0.011 mm; 0 false marks |
-| Centering differs by 0.20 to 1.00 mm | 32/32 detected; offset error at most 0.013 mm |
-| Centering differs by 0.15 mm | 7/8 detected (sits on the default tolerance) |
-| Centering differs by 0.10 mm | 0/8 flagged (below the default tolerance; lower `--tol-mm` to catch it) |
-| Tilt differs by 0.3 degrees | 8/8 detected |
-| Same centering, one copy worn | 8/8 detected; 29/32 planted marks located, 0 marks without a planted cause |
-| Different card design, photo with no card | both rejected with an error |
+| Test | Synthetic design | Lightning Bolt (M10) | Llanowar Elves (DOM) | Serra Angel (4ED, white border, dark table) | Card back |
+|---|---|---|---|---|---|
+| Same copy, two photos: no difference | 8/8 | 8/8 | 8/8 | 8/8 | 8/8 |
+| Same copy: false marks | 0 | 0 | 0 | 0 | 0 |
+| Same copy: largest print displacement (noise floor) | 0.011 mm | 0.015 mm | 0.018 mm | 0.009 mm | 0.011 mm |
+| Centering differs by 0.20 to 1.00 mm: detected | 32/32 | 32/32 | 32/32 | 32/32 | 32/32 |
+| Centering differs by 0.15 mm (at the default tolerance) | 5/8 | 7/8 | 6/8 | 6/8 | 8/8 |
+| Centering differs by 0.10 mm (below the default tolerance) | 0/8 | 0/8 | 0/8 | 0/8 | 0/8 |
+| Largest error in the measured centering difference | 0.013 mm | 0.014 mm | 0.015 mm | 0.011 mm | 0.015 mm |
+| Tilt differs by 0.3 degrees: detected | 8/8 | 8/8 | 8/8 | 8/8 | 8/8 |
+| One copy worn: planted marks located | 32/32 | 29/32 | 23/32 | 26/32 | 32/32 |
+| One copy worn: marks with no planted cause | 0 | 0 | 0 | 0 | 0 |
+| Different card, photo with no card | rejected | rejected | rejected | rejected | rejected |
 
-**Not validated on real card photos.** Real photos add curl, uneven shadows, glare and dust,
-so expect a higher noise floor than these numbers. The 0.15 mm default tolerance is a starting
-point, not a measured value: calibrate it as described above.
+These are simulated photos. Real photos add card curl, uneven shadows, glare and dust, so expect a
+higher noise floor: calibrate as described above before trusting a centering verdict. The tool
+has not yet been tested on photos of physical cards.
 
 ## Limits
 
-- Two mint copies whose centering matches within your noise floor cannot be separated.
-- Wear confined to the outer 0.5 mm of the edge is not compared.
-- Foils and sleeved cards are not supported: glare and reflections swamp the comparison.
-- Dust on the card or lens shows up as marks. Check the diff image before trusting them.
+- Two mint copies whose centering matches within your noise floor cannot be told apart.
+- Wear in the outer 0.5 mm of the edge is not compared.
+- Foils and sleeved cards reflect too much light for a reliable comparison.
+- Dust on the card or the lens shows up as marks, so check the report image before trusting them.
 
-![Example report](example_report.png)
+## Tests
+
+```
+pip install pytest
+pytest
+```
+
+The suite checks photo loading, each verdict on simulated photos with known ground truth, and the
+command-line exit codes. It runs on Linux, macOS and Windows in GitHub Actions.
+
+## License
+
+MIT
+
+Magic: The Gathering is a trademark of Wizards of the Coast. This is an unofficial fan project.
